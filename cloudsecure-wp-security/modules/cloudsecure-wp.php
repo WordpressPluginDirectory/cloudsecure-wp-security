@@ -19,12 +19,13 @@ require_once __DIR__ . '/update-notice.php';
 require_once __DIR__ . '/captcha.php';
 require_once __DIR__ . '/../really-simple-captcha/really-simple-captcha.php';
 require_once __DIR__ . '/lib/class-time-based-one-time-password.php';
+require_once __DIR__ . '/lib/class-recovery-codes.php';
 require_once __DIR__ . '/login-log.php';
 require_once __DIR__ . '/two-factor-authentication.php';
 require_once __DIR__ . '/server-error-notification.php';
+require_once __DIR__ . '/lib/class-waf-rules.php';
 require_once __DIR__ . '/waf-engine.php';
 require_once __DIR__ . '/waf.php';
-require_once __DIR__ . '/lib/class-waf-rules.php';
 require_once __DIR__ . '/disable-access-system-file.php';
 require_once __DIR__ . '/lib/class-disable-access-system-file-rules.php';
 
@@ -62,7 +63,7 @@ class CloudSecureWP extends CloudSecureWP_Common {
 		$this->update_notice              = new CloudSecureWP_Update_Notice( $info, $this->config );
 		$this->captcha                    = new CloudSecureWP_CAPTCHA( $info, $this->config );
 		$this->login_log                  = new CloudSecureWP_Login_Log( $info, $this->config, $this->disable_login );
-		$this->two_factor_authentication  = new CloudSecureWP_Two_Factor_Authentication( $info, $this->config, $this->disable_login );
+		$this->two_factor_authentication  = new CloudSecureWP_Two_Factor_Authentication( $info, $this->config, $this->disable_login, $this->login_log );
 		$this->server_error_notification  = new CloudSecureWP_Server_Error_Notification( $info, $this->config );
 		$this->waf                        = new CloudSecureWP_Waf( $info, $this->config );
 		$this->disable_access_system_file = new CloudSecureWP_Disable_Access_System_File( $info, $this->config );
@@ -140,10 +141,11 @@ class CloudSecureWP extends CloudSecureWP_Common {
 			}
 
 			if ( $this->disable_access_system_file->is_enabled() ) {
-				add_action( 'plugins_loaded', array( $this->disable_access_system_file, 'init' ), 10 );
+				add_action( 'plugins_loaded', array( $this->disable_access_system_file, 'init' ), 11 );
 			}
 
 			add_action( 'wp_login', array( $this->login_log, 'wp_login' ), 1, 1 );
+			add_action( 'wp_login', array( $this->two_factor_authentication, 'cleanup_expired_sessions' ), 2, 0 );
 			add_action( 'xmlrpc_call', array( $this->login_log, 'xmlrpc_call' ), 10 );
 			add_action( 'wp_login_failed', array( $this->login_log, 'wp_login_failed' ), 20, 1 );
 
@@ -256,8 +258,19 @@ class CloudSecureWP extends CloudSecureWP_Common {
 				}
 			}
 
+			if ( $this->two_factor_authentication->is_enabled() ) {
+				// 2段階認証のAJAXハンドラー
+				add_action( 'wp_ajax_cloudsecurewp_generate_key', array( $this->two_factor_authentication, 'ajax_generate_key' ) );
+				add_action( 'wp_ajax_cloudsecurewp_generate_key_and_send_email', array( $this->two_factor_authentication, 'ajax_generate_key_and_send_email' ) );
+				add_action( 'wp_ajax_cloudsecurewp_verify_auth_code', array( $this->two_factor_authentication, 'ajax_verify_auth_code' ) );
+				add_action( 'wp_ajax_cloudsecurewp_generate_recovery_codes', array( $this->two_factor_authentication, 'ajax_generate_recovery_codes' ) );
+			}
+
 			if ( $this->two_factor_authentication->is_enabled() && 'xmlrpc.php' !== basename( $_SERVER['SCRIPT_NAME'] ) && ! is_admin() ) {
-				add_action( 'wp_login', array( $this->two_factor_authentication, 'wp_login' ), 0, 2 );
+				add_filter( 'sanitize_user', array( $this->two_factor_authentication, 'restore_login_name' ), 0, 1 );
+				add_filter( 'authenticate', array( $this->two_factor_authentication, 'restore_login_session' ), 0, 3 );
+				add_filter( 'authenticate', array( $this->two_factor_authentication, 'two_factor_disable_login_check' ), 100, 3 );
+				add_filter( 'authenticate', array( $this->two_factor_authentication, 'authenticate_with_two_factor' ), 101, 3 );
 				add_action( 'wp_login', array( $this->two_factor_authentication, 'redirect_if_not_two_factor_authentication_registered' ), 10, 2 );
 			}
 
@@ -352,7 +365,7 @@ class CloudSecureWP extends CloudSecureWP_Common {
 		add_submenu_page( $slug, 'ログイン履歴', 'ログイン履歴', 'manage_options', $slug . '_login_log', array( $this, 'm_login_log' ) );
 
 		if ( $this->two_factor_authentication->is_enabled_on_screen() ) {
-			add_menu_page( 'デバイス登録', '2段階認証', 'read', $slug . '_two_factor_authentication_registration', array( $this, 'm_two_factor_authentication_registration' ), 'dashicons-lock', 72 );
+			add_menu_page( '2段階認証の設定', '2段階認証の設定', 'read', $slug . '_two_factor_authentication_registration', array( $this, 'm_two_factor_authentication_registration' ), 'dashicons-lock', 72 );
 		}
 	}
 
@@ -548,6 +561,102 @@ class CloudSecureWP extends CloudSecureWP_Common {
 	}
 
 	/**
+	 * CLI用のgetterメソッド群
+	 * 注意: これらのメソッドはWP-CLI環境でのみ使用されることを想定しています
+	 */
+	private function validate_cli_access() {
+		// WP-CLI環境チェック
+		if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
+			wp_die( 'Unauthorized access: CLI only' );
+		}
+	}
+
+	public function get_config() {
+		$this->validate_cli_access();
+		return $this->config;
+	}
+
+	public function get_htaccess() {
+		$this->validate_cli_access();
+		return $this->htaccess;
+	}
+
+	public function get_login_notification() {
+		$this->validate_cli_access();
+		return $this->login_notification;
+	}
+
+	public function get_disable_login() {
+		$this->validate_cli_access();
+		return $this->disable_login;
+	}
+
+	public function get_rename_login_page() {
+		$this->validate_cli_access();
+		return $this->rename_login_page;
+	}
+
+	public function get_unify_messages() {
+		$this->validate_cli_access();
+		return $this->unify_messages;
+	}
+
+	public function get_restrict_admin_page() {
+		$this->validate_cli_access();
+		return $this->restrict_admin_page;
+	}
+
+	public function get_disable_xmlrpc() {
+		$this->validate_cli_access();
+		return $this->disable_xmlrpc;
+	}
+
+	public function get_disable_author_query() {
+		$this->validate_cli_access();
+		return $this->disable_author_query;
+	}
+
+	public function get_disable_restapi() {
+		$this->validate_cli_access();
+		return $this->disable_restapi;
+	}
+
+	public function get_update_notice() {
+		$this->validate_cli_access();
+		return $this->update_notice;
+	}
+
+	public function get_captcha() {
+		$this->validate_cli_access();
+		return $this->captcha;
+	}
+
+	public function get_login_log() {
+		$this->validate_cli_access();
+		return $this->login_log;
+	}
+
+	public function get_two_factor_authentication() {
+		$this->validate_cli_access();
+		return $this->two_factor_authentication;
+	}
+
+	public function get_server_error_notification() {
+		$this->validate_cli_access();
+		return $this->server_error_notification;
+	}
+
+	public function get_waf() {
+		$this->validate_cli_access();
+		return $this->waf;
+	}
+
+	public function get_disable_access_system_file() {
+		$this->validate_cli_access();
+		return $this->disable_access_system_file;
+	}
+
+	/**
 	 * プラグイン更新時の処理
 	 */
 	private function update(): void {
@@ -575,6 +684,14 @@ class CloudSecureWP extends CloudSecureWP_Common {
 		if ( version_compare( $old_version, '1.3.7' ) < 0 ) {
 			$this->waf->activate();
 			$this->server_error_notification->activate();
+		}
+
+		if ( version_compare( $old_version, '1.3.24' ) < 0 ) {
+			$this->htaccess->reorganize_plugin_settings_blocks();
+		}
+
+		if ( version_compare( $old_version, '1.4.0' ) < 0 ) {
+			$this->two_factor_authentication->setup_2fa_tables();
 		}
 
 		$this->config->set( 'version', $now_version );
